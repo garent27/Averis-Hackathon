@@ -2,3 +2,13 @@
 __pycache__/
 *.pyc
 solution/_debug_*
+
+# webapp backend
+solution/webapp/backend/data/
+solution/webapp/backend/server.log
+
+# webapp frontend
+solution/webapp/frontend/node_modules/
+solution/webapp/frontend/dist/
+solution/webapp/frontend/vite.log
+solution/webapp/frontend/.vite/
