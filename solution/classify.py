@@ -1,13 +1,23 @@
 #!/usr/bin/env python3
 """
-classify.py — baseline pipeline: fetch every email from the running Docker
+classify.py — hybrid pipeline: fetch every email from the running Docker
 server, classify it, write submission.json, and self-score it.
 
-Right now classify_email() is a stub that defaults everything to GENERAL/OK.
-The point of running this first is to prove the plumbing works end-to-end
-(fetch -> build submission -> submit -> get a score) BEFORE writing real
-classification logic. Once this runs cleanly, replace classify_email() with
-real rules/model and re-run.
+Classification is hybrid, cheapest tier first:
+  1. rule_classify_email() -- regex on the dataset's known subject-line
+     templates (sdoc-docker/data_v2/emails.py + pools.py). Free, instant,
+     exact on this dataset. Returns None if no rule matches with confidence.
+  2. Only when step 1 returns None: llm.classify_email() -- one API call,
+     structured JSON output. Handles messy/unusual phrasing rules don't cover.
+
+Extraction (build_result -> extract_compare.extract_fields) is hybrid the
+same way: deterministic label-matching first, LLM text fallback only for
+fields it couldn't find, vision LLM fallback only for image-only PDFs. See
+extract_compare.py's docstring.
+
+Needs ANTHROPIC_API_KEY set (or an `ant auth login` profile) for the LLM
+fallback tiers -- those calls are real and billed, but on this dataset the
+rule/regex tier resolves nearly everything, so fallback volume stays low.
 
 Usage:
     python classify.py
@@ -16,22 +26,24 @@ import json
 
 from loader import Inbox
 from extract_compare import extract_fields, compare_fields
+import llm
 
 SERVER = "http://localhost:8080"
 OUTPUT_PATH = "submission.json"
 
 
 # Signal patterns below are read directly off the dataset generator
-# (sdoc-docker/data_v2/emails.py + pools.py), not guessed — since this data is
-# built from fixed subject-line templates per category, the generator source
-# tells us the exact vocabulary each category actually uses.
+# (sdoc-docker/data_v2/emails.py + pools.py) -- since this data is built from
+# fixed subject-line templates per category, the generator source tells us
+# the exact vocabulary each category actually uses. Any subject that matches
+# none of these falls through to the LLM classifier instead of a blind
+# GENERAL default.
 
 # emails.py: subject_bl_comparison() coded-style prefix uses pools.DEPARTMENTS.
 BL_DEPARTMENT_CODES = ("AIE", "AFPTME", "AFRT", "AFEMY")
 
 # emails.py: SPAM_SUBJECTS is a small FIXED list picked verbatim (rng.choice),
-# so exact matching gets 100% precision/recall on this dataset. Kept as a set
-# for O(1) lookup.
+# so exact matching gets 100% precision/recall on this dataset.
 SPAM_SUBJECTS_EXACT = {
     "Congratulations! You have WON a $1,000 Gift Card - CLAIM NOW",
     "Your parcel is on hold - confirm payment of $2.99 to release",
@@ -45,7 +57,6 @@ SPAM_SUBJECTS_EXACT = {
     "Bitcoin investment opportunity - guaranteed 300% returns",
 }
 
-# Generic fallback in case real/unseen spam doesn't match the exact list above.
 SPAM_KEYWORDS = [
     "CLAIM NOW", "CLAIM YOUR PRIZE", "GIFT CARD", "CONFIRM PAYMENT",
     "VERIFY ACCOUNT", "VERIFY YOUR ACCOUNT", "AVOID SUSPENSION",
@@ -70,19 +81,27 @@ INVOICE_QUERY_KEYWORDS = [
     "TOTAL FREIGHT",
 ]
 
+# emails.py: subject_general() styles. Explicit patterns rather than a blind
+# default, so a genuinely unrecognised subject falls through to the LLM
+# instead of being silently mislabeled GENERAL.
+GENERAL_KEYWORDS = [
+    "UPDATE SUMMARY", "BERTHING REPORT", "_REMINDER_", "_RPA_",
+    "OUTSTANDING BL", "PENDING BL RELEASE", "WELCOMING THE NEW YEAR",
+    "APPROVAL REQUIRED", "TIME OFF REQUEST", "MISS CONNECTION",
+    "DELIVERY PLANNING",
+]
+
 
 def _strip_re_prefix(subject: str) -> str:
     """emails.py prepends 'RE_ ' to ~50% of BL_COMPARISON/SI_REQUEST subjects."""
     return subject[len("RE_ "):] if subject.startswith("RE_ ") else subject
 
 
-def classify_email(email: dict) -> str:
-    """Return one of: BL_COMPARISON, SI_REQUEST, INVOICE_QUERY, GENERAL, SPAM.
-
-    Rule-based on the exact subject-line templates used by the dataset
-    generator. Checked in order: SPAM (most distinctive / highest cost to
-    miss) -> BL_COMPARISON -> SI_REQUEST -> INVOICE_QUERY -> GENERAL
-    (catch-all default, matching the real mix where GENERAL is a grab-bag).
+def rule_classify_email(email: dict) -> str | None:
+    """Return one of the 5 categories if a known subject-line pattern
+    matches with confidence, else None (caller should fall back to the LLM).
+    Checked in order: SPAM (most distinctive / highest cost to miss) ->
+    BL_COMPARISON -> SI_REQUEST -> INVOICE_QUERY -> GENERAL.
     """
     raw_subject = email["subject"]
     subject = _strip_re_prefix(raw_subject)
@@ -106,7 +125,21 @@ def classify_email(email: dict) -> str:
     if any(kw in upper for kw in INVOICE_QUERY_KEYWORDS):
         return "INVOICE_QUERY"
 
-    return "GENERAL"
+    if any(kw in upper for kw in GENERAL_KEYWORDS):
+        return "GENERAL"
+
+    return None
+
+
+def classify_email(email: dict) -> str:
+    """Return one of: BL_COMPARISON, SI_REQUEST, INVOICE_QUERY, GENERAL, SPAM.
+    Rules first (free, exact on known patterns); LLM fallback only when no
+    rule matches."""
+    category = rule_classify_email(email)
+    if category is not None:
+        return category
+    print(f"  ? {email['email_id']}: no rule matched, falling back to LLM")
+    return llm.classify_email(email)
 
 
 def _find_attachment(attachments: list, marker: str):
@@ -160,6 +193,8 @@ def build_result(email: dict, inbox: Inbox) -> dict:
         result["status"] = "MISMATCH"
         result["has_defect"] = True
         result["defect_fields"] = defect_fields
+        
+        print(f"  ! {email['email_id']}: found defects: {defect_fields}")
 
     return result
 
