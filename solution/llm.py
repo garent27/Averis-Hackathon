@@ -13,27 +13,31 @@ only call into here when the deterministic pass is unconfident or incomplete):
     no text layer at all (image-only/scanned PDF), so plain-text extraction
     has nothing to work with.
 
-This is intentionally basic (single-shot prompts, no few-shot examples, no
-retry/validation beyond what the SDK does) -- a starting point to iterate on:
-better prompts, few-shot examples for edge cases, confidence/uncertainty
-signals for NEEDS_REVIEW routing, etc.
+Uses Google Gemini (free tier via Google AI Studio) instead of a paid API --
+good enough for a basic fallback tier to iterate on: better prompts, few-shot
+examples for edge cases, confidence/uncertainty signals for NEEDS_REVIEW
+routing, etc.
 
-Requires ANTHROPIC_API_KEY in the environment (or an `ant auth login` profile).
-Every call here costs a small amount of real money on your Anthropic account.
+Requires GOOGLE_API_KEY -- read from a local .env file (see .env in this
+folder; keep it out of git, already covered by .gitignore) or the environment.
 Being the fallback tier (not the primary path) keeps call volume low -- most
 emails/attachments in this dataset are resolved by rules/regex for free and
-never reach this module.
+never reach this module at all.
 """
-import base64
+import os
 from enum import Enum
 from typing import Optional
 
-import anthropic
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from pydantic import BaseModel
 
-MODEL = "claude-opus-5"
+load_dotenv()  # reads GOOGLE_API_KEY from .env next to this file
 
-client = anthropic.Anthropic()
+MODEL = "gemini-2.5-flash"
+
+client = genai.Client(api_key=os.environ.get("GOOGLE_API_KEY"))
 
 
 # ---------------------------------------------------------------------------
@@ -74,13 +78,15 @@ def classify_email(email: dict) -> str:
         subject=email.get("subject", ""),
         body=email.get("body", ""),
     )
-    response = client.messages.parse(
+    response = client.models.generate_content(
         model=MODEL,
-        max_tokens=256,
-        messages=[{"role": "user", "content": prompt}],
-        output_format=ClassificationResult,
+        contents=prompt,
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ClassificationResult,
+        ),
     )
-    return response.parsed_output.category.value
+    return response.parsed.category.value
 
 
 # ---------------------------------------------------------------------------
@@ -121,13 +127,15 @@ def extract_fields_raw(document_text: str) -> dict:
     pass them through extract_compare.py's normalizer before comparing."""
     if not document_text.strip():
         return {}
-    response = client.messages.parse(
+    response = client.models.generate_content(
         model=MODEL,
-        max_tokens=512,
-        messages=[{"role": "user", "content": EXTRACT_PROMPT.format(text=document_text)}],
-        output_format=ShipmentFields,
+        contents=EXTRACT_PROMPT.format(text=document_text),
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ShipmentFields,
+        ),
     )
-    return {k: v for k, v in response.parsed_output.model_dump().items() if v is not None}
+    return {k: v for k, v in response.parsed.model_dump().items() if v is not None}
 
 
 VISION_EXTRACT_PROMPT = """This is a page from a scanned/image-only shipping document (SI or BL) --
@@ -152,17 +160,15 @@ def extract_fields_vision(image_bytes: bytes, media_type: str = "image/png") -> 
     vision LLM call with structured JSON output. Used only when plain-text
     extraction found no usable text at all (image-only/scanned PDF) -- the
     "Scanned documents" advanced-stage case from the spec."""
-    image_b64 = base64.standard_b64encode(image_bytes).decode("utf-8")
-    response = client.messages.parse(
+    response = client.models.generate_content(
         model=MODEL,
-        max_tokens=512,
-        messages=[{
-            "role": "user",
-            "content": [
-                {"type": "image", "source": {"type": "base64", "media_type": media_type, "data": image_b64}},
-                {"type": "text", "text": VISION_EXTRACT_PROMPT},
-            ],
-        }],
-        output_format=ShipmentFields,
+        contents=[
+            types.Part.from_bytes(data=image_bytes, mime_type=media_type),
+            VISION_EXTRACT_PROMPT,
+        ],
+        config=types.GenerateContentConfig(
+            response_mime_type="application/json",
+            response_schema=ShipmentFields,
+        ),
     )
-    return {k: v for k, v in response.parsed_output.model_dump().items() if v is not None}
+    return {k: v for k, v in response.parsed.model_dump().items() if v is not None}

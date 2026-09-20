@@ -177,6 +177,7 @@
     "status": "MISMATCH",
     "review_reason": null,
     "defect_fields": [
+      "container_count",
       "port_of_discharge"
     ],
     "has_defect": true
